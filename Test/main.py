@@ -100,7 +100,7 @@ def transfer_execute_download(
     remote_output_path: Optional[str] = None,
     log_file: str = 'transfer_log.txt'
 ) -> bool:
-    """Enhanced transfer, execute, and download function with robust error handling"""
+    """Enhanced transfer, execute, and download function with robust command waiting"""
     try:
         logger.info(f"Starting execution on machine {host}")
 
@@ -131,29 +131,81 @@ def transfer_execute_download(
         sftp.put(local_script_path, remote_script_path)
         logger.info(f"Transferred script to {remote_script_path}")
 
-        # Unzip the script
-        ssh.exec_command(f'unzip -o {remote_script_path} -d {remote_collection_dir}')
+        # Unzip the script with error checking
+        unzip_channel = ssh.get_transport().open_session()
+        unzip_command = f'unzip -o {remote_script_path} -d {remote_collection_dir}'
+        unzip_channel.exec_command(unzip_command)
+        logger.info(f"Executing unzip: {unzip_command}")
         
-        # Set permissions
-        ssh.exec_command(f'chmod -R 755 {remote_collection_dir}')
+        unzip_exit_status = unzip_channel.recv_exit_status()
+        unzip_stdout = unzip_channel.recv(4096).decode('utf-8', errors='ignore')
+        unzip_stderr = unzip_channel.recv_stderr(4096).decode('utf-8', errors='ignore')
+        
+        if unzip_exit_status != 0:
+            logger.error(f"Unzip failed (Status {unzip_exit_status}):")
+            logger.error(f"STDOUT: {unzip_stdout}")
+            logger.error(f"STDERR: {unzip_stderr}")
+            raise Exception("Failed to unzip script")
+
+        # Set permissions to 777 for the entire Collection folder
+        perm_channel = ssh.get_transport().open_session()
+        perm_command = f'chmod -R 777 {remote_collection_dir}'
+        perm_channel.exec_command(perm_command)
+        logger.info(f"Executing permission change: {perm_command}")
+        
+        perm_exit_status = perm_channel.recv_exit_status()
+        perm_stdout = perm_channel.recv(4096).decode('utf-8', errors='ignore')
+        perm_stderr = perm_channel.recv_stderr(4096).decode('utf-8', errors='ignore')
+        
+        if perm_exit_status != 0:
+            logger.error(f"Permission setting failed (Status {perm_exit_status}):")
+            logger.error(f"STDOUT: {perm_stdout}")
+            logger.error(f"STDERR: {perm_stderr}")
+            raise Exception("Failed to set permissions")
 
         # Prepare script execution
-        collection_file_path = os.path.join(remote_collection_dir, 'Collection/bin/')
-        full_command = f'bash {collection_file_path} {command}'
+        collection_bin_path = os.path.join(remote_collection_dir, 'Collection/bin/')
+
+        # Change to the bin directory and execute the command
+        full_command = f'cd {collection_bin_path} && {command}'
         
-        logger.info(f"Executing command: {full_command}")
-        stdin, stdout, stderr = ssh.exec_command(full_command)
-        exit_status = stdout.channel.recv_exit_status()
+        logger.info(f"Executing main command: {full_command}")
+        
+        # Create a new channel for command execution
+        exec_channel = ssh.get_transport().open_session()
+        exec_channel.exec_command(full_command)
+        
+        # Capture and log full output
+        stdout_output = ""
+        stderr_output = ""
+        
+        # Read stdout
+        while not exec_channel.exit_status_ready():
+            if exec_channel.recv_ready():
+                chunk = exec_channel.recv(4096).decode('utf-8', errors='ignore')
+                stdout_output += chunk
+                logger.info(f"STDOUT: {chunk}")
+            time.sleep(0.1)
+        
+        # Read stderr
+        while exec_channel.recv_stderr_ready():
+            chunk = exec_channel.recv_stderr(4096).decode('utf-8', errors='ignore')
+            stderr_output += chunk
+            logger.error(f"STDERR: {chunk}")
+        
+        # Get final exit status
+        exit_status = exec_channel.recv_exit_status()
         
         if exit_status == 0:
             logger.info("Command executed successfully")
         else:
             logger.error(f"Command execution failed with status {exit_status}")
-            error_output = stderr.read().decode()
-            logger.error(f"Error output: {error_output}")
+            logger.error(f"Full STDOUT: {stdout_output}")
+            logger.error(f"Full STDERR: {stderr_output}")
+            return False
 
         # Find and transfer output files
-        remote_output_dir = os.path.join(collection_file_path, 'output')
+        remote_output_dir = os.path.join(collection_bin_path, 'output')
         
         # Ensure local output directory exists
         os.makedirs(local_output_path, exist_ok=True)
